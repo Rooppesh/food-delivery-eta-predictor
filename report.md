@@ -62,27 +62,115 @@ The marketplace-load feature `orders_per_dasher` is the single biggest predictor
 than the platform's own duration estimates.
 
 ## Error Analysis
-### Residuals
-- Mean residual ≈ +78s (slight under-prediction)
-- Median residual ≈ −63s (model slightly over-predicts the median order)
-- Std ≈ 906s — wide tails.
+
+Notebook `05_error_analysis.ipynb` follows the 7-section framework from
+[*AI/ML Learning Notes — Day 23: Model Error Analysis*](https://jaspinders30.substack.com/p/ai-ml-learning-notes-day-23-model),
+adapted for regression (FP/FN → signed residuals; threshold sweep → ETA-quote slack δ; ROC-AUC vs decision metrics → Spearman ρ vs MAE).
+
+### Error decomposition (signed)
+| Direction | Share | Mean \|err\| (s) | p90 \|err\| (s) |
+|---|---:|---:|---:|
+| Under-predicted (actual > quote — costly) | 47% | 787 | 1,732 |
+| Over-predicted (actual < quote — slack) | 53% | 532 | 1,042 |
+
+Under-predictions are fewer but **~50% larger** on average — the model is more wrong in the more painful direction.
+
+### Magnitude concentration
+| \|error\| bucket (s) | Share of rows | Share of total |error| |
+|---|---:|---:|
+| 0–300 | 31% | 7% |
+| 300–600 | 27% | 18% |
+| 600–1,200 | 29% | 37% |
+| 1,200–3,000 | 12% | 31% |
+| 3,000+ | 1% | 7% |
+
+The top 13% of orders by error account for **~37%** of total absolute error — that's where there's leverage.
 
 ### Long-tail breakdown
 | Bucket | n | MAE (s) |
 |---|---:|---:|
-| < 30 min | 4,399 | 707 |
-| 30–60 min | 25,789 | 455 |
-| > 60 min | 9,269 | 1,184 |
+| < 30 min | 4,399 | 699 |
+| 30–60 min | 25,789 | 450 |
+| > 60 min | 9,269 | 1,193 |
 
-Model is sharpest in the dominant 30–60 min band and degrades hard on > 60 min orders —
-typical regression-toward-the-mean behaviour amplified by sparse training signal in the tail.
+Model is sharpest in the dominant 30–60 min band and degrades ~2.6× on > 60 min orders.
 
 ### Worst segments
-- **By hour**: 2pm–4pm is the worst (MAE up to ~1,211s at 14h) — peak lunch-wave congestion.
-- **By store category**: rare cuisines (lebanese, belgian, spanish, tapas) — small sample,
-  high variance in prep times.
-- **By market**: market 1 worst (MAE 766s), market 2 best (MAE 591s); rows with missing
-  market_id are also high-error (MAE 823s).
+- **By hour**: 14h–16h is the worst (MAE 1,188 s at 14h, 940 s at 15h) — lunch-rush congestion.
+- **By store category**: rare cuisines (lebanese, belgian, spanish, …) — small sample, high prep-time variance.
+- **By market**: market 1 worst (MAE 766 s), market 2 best (MAE 591 s); rows with missing market_id also high-error (821 s).
+
+### Feature ablation (XGBoost, ΔMAE on test)
+| Group removed | n features kept | MAE (s) | ΔMAE vs full |
+|---|---:|---:|---:|
+| marketplace | 17 | 697.0 | **+44.7** |
+| platform estimates | 20 | 682.6 | +30.3 |
+| time | 18 | 671.7 | +19.3 |
+| categorical (freq) | 19 | 667.4 | +15.0 |
+| price | 17 | 660.2 | +7.9 |
+| **order composition** | 19 | 652.1 | **−0.2** |
+
+`marketplace` is the heaviest hitter; `order composition` is **redundant** — removing it slightly improves the model. That's exactly the article's red-flag pattern: candidate for retirement.
+
+### Ranking vs decision (metric separation)
+| Metric | Value |
+|---|---:|
+| MAE (s) | 652.1 |
+| RMSE (s) | 909.3 |
+| Spearman ρ | 0.62 |
+| **Mean residual (s)** | **+89.6** |
+| Median residual (s) | −53.2 |
+
+The model **ranks** deliveries reasonably (ρ = 0.62) but systematically **under-predicts** by ~90 s. A constant `+90` recalibration is a free win on the decision metric without retraining.
+
+### Cost-aware ETA quote (decision-threshold analogue)
+Sweeping an additive slack `δ` on the quote and minimising `C_under·P(under) + C_over·P(over)`:
+
+| Cost ratio (under : over) | Optimal δ (s) |
+|---|---:|
+| 1 : 1 (symmetric) | ≈ 0 |
+| 3 : 1 | ~+200 |
+| 5 : 1 (article default) | ~+400 |
+
+Realistic asymmetry pushes the customer-facing quote a few minutes higher than the point estimate.
+
+## Classification framing — predicting the bucket
+
+To answer *“is this delivery going to be late?”* directly, we also reframed the task as
+a 3-class problem on the same buckets used in the long-tail analysis (`<30 / 30–60 / >60 min`).
+Test-set class balance is 11% / 65% / 23% — imbalanced enough that **PR-AUC**, not
+accuracy, is the right headline.
+
+### PR-AUC by class (one-vs-rest)
+| Model | <30min | 30-60min | **>60min** | macro | weighted | ROC-AUC (macro) |
+|---|---:|---:|---:|---:|---:|---:|
+| LogisticRegression | 0.367 | 0.752 | 0.503 | 0.541 | 0.651 | 0.745 |
+| RandomForestClassifier | 0.391 | 0.744 | 0.521 | 0.552 | 0.652 | 0.751 |
+| **XGBClassifier** | **0.417** | **0.766** | **0.555** | **0.580** | **0.678** | **0.774** |
+
+The `>60min` class is the operationally critical one (an undetected late delivery is the
+worst customer outcome). XGBClassifier's PR-AUC on it (0.555) is ~5× the random-baseline
+prevalence (~0.23), and meaningfully above the other two classifiers.
+
+### Is a dedicated classifier worth it vs binning the regressor?
+Take the XGBoost **regressor**'s seconds output and bucket it. Result:
+
+| Class | Precision | Recall | F1 | Support |
+|---|---:|---:|---:|---:|
+| <30min | 0.615 | 0.120 | 0.201 | 4,399 |
+| 30-60min | 0.705 | 0.913 | 0.795 | 25,789 |
+| **>60min** | **0.628** | **0.351** | **0.450** | **9,269** |
+| accuracy | | | **0.693** | 39,457 |
+
+The regressor-then-bin baseline only catches **35% of >60min deliveries** — most long
+deliveries get pulled toward the dominant 30-60min bucket (classic regression-toward-
+the-mean). The dedicated classifier is the right tool when the *signal* you want is the
+late-delivery probability — and it gives you a tunable score, not just a hard label, so
+you can choose your operating point on the PR curve.
+
+**Recommendation:** keep XGBoost regression as the primary model (customer-facing ETA
+quote needs seconds), and use the XGBoost classifier's `P(>60 min)` as a parallel
+risk-flag for dispatcher / operations dashboards.
 
 ## Conclusions
 - **Marketplace state matters more than order details.** The strongest features were

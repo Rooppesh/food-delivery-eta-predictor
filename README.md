@@ -29,6 +29,10 @@ food-delivery-eta-predictor/
 All logic — preprocessing, feature engineering, training, evaluation — lives directly
 in the notebooks. There is no `src/` package to import from.
 
+The project covers two framings: **regression** (predict delivery seconds — primary)
+and **classification** (predict the `<30 / 30–60 / >60 min` bucket, evaluated with
+PR-AUC — diagnostic / risk-flagging).
+
 ## Setup
 ```bash
 pip install -r requirements.txt
@@ -44,8 +48,10 @@ jupyter notebook notebooks/
 3. `03_feature_engineering.ipynb` — time / marketplace / price / complexity / categorical features.
 4. `04_advanced_models.ipynb` — Decision Tree, Random Forest, XGBoost + feature importance.
 5. `05_error_analysis.ipynb` — residuals, worst predictions, segment MAE, long-tail.
+6. `06_classification.ipynb` — 3-bucket classifier (`<30 / 30–60 / >60 min`),
+   PR-AUC headline + regress-then-bin comparison. Depends on 03 and 04.
 
-Notebooks 02 → 05 read intermediate CSVs from `reports/`, so run them in order the
+Notebooks 02 → 06 read intermediate CSVs from `reports/`, so run them in order the
 first time.
 
 ## Results summary
